@@ -41,13 +41,17 @@
 //+------------------------------------------------------------------+
 #property copyright   "Copyright 2026, otaznik.sk - Michal Škop"
 #property link        "https://www.mql5.com/en/users/otazniksk"
-#property version     "1.00"
+// Internal version: raise it with every change (shown in the chart's indicator list).
+#define PP_VERSION "1.08"
+#property version     PP_VERSION
 #property description "TradingView-style Long/Short position planner: draw boxes, drag Entry/Stop/Target,"
 #property description "lot size by risk, R:R, trade result simulated on real bars, statistics, navigation, JSON export."
 #property description "No DLL, no internet access, never places or modifies trades."
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
+
+#include <Generic\HashMap.mqh>
 
 //--- enums ----------------------------------------------------------
 enum ENUM_RISK_MODE
@@ -101,6 +105,7 @@ input int               InpPanelY     = 10;               // Panel Y offset (px)
 input group "Export"
 input bool              InpShowExport = false;            // Show Export button (JSON to MQL5\Files\PositionPlanner)
 input bool              InpExportLockedOnly = false;      // Export only locked boxes
+input bool              InpAutoBackup = false;            // Auto backup after every change (MQL5\Files\PositionPlanner\backup)
 
 input group "Debug"
 input bool              InpDebug      = false;            // Debug: log to Experts tab
@@ -174,6 +179,15 @@ int    g_hoverId     = -1;
 int    g_hoverHit    = HIT_NONE;
 uint   g_lastRefresh = 0;
 uint   g_clearArmed  = 0;
+// Restore / auto backup state
+#define RESTORE_ARM_MS 15000
+uint   g_restArmed = 0;
+string g_restFile  = "";
+string g_bakSig    = "";
+bool   g_bakFirst  = true;
+uint   g_bakCheck  = 0;
+uint   g_bakRetry  = 0;   // tick of the last failed backup (0 = none) -> retry after 5 s
+int    g_restTotal = 0, g_restFresh = 0;   // what the armed Restore would add (shown in the stats box)
 int    g_placeDir    = 0;     // armed Long(+1)/Short(-1) placement: next chart click creates the box
 color  g_bg          = clrNONE;
 bool   g_dark        = true;
@@ -655,11 +669,20 @@ void FreeBadges(const string prefix)
 
 // Render a rounded badge (anti-aliased) with 1..n centered text lines.
 // border = clrNONE -> no border. Re-renders only when content changes.
+void BadgeFont(const bool hi, const bool bold, const int fsize)
+  {
+   if(hi)
+      TextSetFont(FONT, -(fsize + 1) * 10, FW_BOLD);
+   else
+      TextSetFont(FONT, -fsize * 10, bold ? FW_SEMIBOLD : FW_NORMAL);
+  }
+
+// hiLine >= 0: that line is highlighted (bold, one size bigger) with a gap above and below.
 void BuildBadge(const string obj, const string &lines[], const color bg, const color border,
-                const bool bold, const int fsize, int &w, int &h)
+                const bool bold, const int fsize, int &w, int &h, const int hiLine = -1)
   {
    int n = ArraySize(lines);
-   string sig = StringFormat("%u|%u|%d|%d|", bg, border, bold, fsize);
+   string sig = StringFormat("%u|%u|%d|%d|%d|", bg, border, bold, fsize, hiLine);
    for(int i = 0; i < n; i++)
       sig += lines[i] + "\n";
    int k = BadgeCache(obj);
@@ -670,18 +693,22 @@ void BuildBadge(const string obj, const string &lines[], const color bg, const c
       return;
      }
 
-   TextSetFont(FONT, -fsize * 10, bold ? FW_SEMIBOLD : FW_NORMAL);
    uint tw = 0, th = 0;
-   int maxw = 0, lh = 0;
+   int maxw = 0, lh = 0, hiH = 0;
    for(int i = 0; i < n; i++)
      {
+      BadgeFont(i == hiLine, bold, fsize);
       TextGetSize(lines[i], tw, th);
       maxw = MathMax(maxw, (int)tw);
-      lh   = MathMax(lh, (int)th);
+      if(i == hiLine)
+         hiH = (int)th;
+      else
+         lh = MathMax(lh, (int)th);
      }
-   int padX = 11, padY = 4, gap = 0;
+   int padX = 11, padY = 4, hiGap = 5;
+   bool hi = hiLine >= 0 && hiLine < n;
    w = maxw + 2 * padX;
-   h = n * lh + (n - 1) * gap + 2 * padY;
+   h = (hi ? (n - 1) * lh + hiH + 2 * hiGap : n * lh) + 2 * padY;
 
    uint data[];
    ArrayResize(data, w * h);
@@ -712,8 +739,16 @@ void BuildBadge(const string obj, const string &lines[], const color bg, const c
         }
 
    uint fg = ARGB(cText, 1.0);
+   int y = padY;
    for(int i = 0; i < n; i++)
-      TextOut(lines[i], w / 2, padY + i * (lh + gap) - 1, TA_CENTER | TA_TOP, data, w, h, fg, COLOR_FORMAT_ARGB_NORMALIZE);
+     {
+      bool isHi = hi && i == hiLine;
+      if(isHi)
+         y += hiGap;
+      BadgeFont(isHi, bold, fsize);
+      TextOut(lines[i], w / 2, y - 1, TA_CENTER | TA_TOP, data, w, h, fg, COLOR_FORMAT_ARGB_NORMALIZE);
+      y += isHi ? hiH + hiGap : lh;
+     }
 
    string res = ResName(obj);
    ResourceCreate(res, data, w, h, 0, 0, w, COLOR_FORMAT_ARGB_NORMALIZE);
@@ -756,6 +791,8 @@ struct STrade
    string   reason;     // real: "Target hit", "Stop hit", "Break-even", "Closed manually", ...
    datetime tInExact;   // real: exact entry deal time
    datetime tOutExact;  // real: exact (last) closing deal time
+   datetime tExit;      // simulated: best known exit time (the M1 minute when resolved, else the bar)
+   bool     exitMin;    // simulated: tExit is the M1 minute (else only the bar is known)
    bool     unknown;    // linked box whose real data is not available (history) -> no result at all
   };
 
@@ -1024,6 +1061,166 @@ bool RealTrade(const SPos &p, STrade &tr)
    return true;
   }
 
+// Simulated close at Stop (state -1) or Target (state 1) in the chart bar starting at t.
+// tExit = the M1 minute of the hit when known (0 = only the bar is known).
+void SimClose(const SPos &p, STrade &tr, const int state, const datetime t, const datetime tExit = 0)
+  {
+   tr.state     = state;
+   tr.exitPrice = state < 0 ? p.sl : p.tp;
+   tr.tOut      = t;
+   tr.tExit     = tExit > 0 ? tExit : t;
+   tr.exitMin   = tExit > 0;
+   tr.closed    = true;
+  }
+
+// Last second of chart bar idx (r = rates oldest first). Uses the next bar's open time, so
+// months of any length and session gaps are handled.
+datetime BarEnd(const MqlRates &r[], const int idx, const int n)
+  {
+   if(idx + 1 < n)
+      return (datetime)((long)r[idx + 1].time - 1);
+   int sh = iBarShift(_Symbol, _Period, r[idx].time, true);
+   if(sh > 0)
+     {
+      datetime nx = iTime(_Symbol, _Period, sh - 1);
+      if(nx > r[idx].time)
+         return (datetime)((long)nx - 1);
+     }
+   return TimeCurrent();
+  }
+
+// Cache of M1 decisions for finished chart bars (a finished bar never changes) - the
+// simulation runs on every tick / redraw / stats refresh, M1 data is read once per bar + levels.
+#define M1C_SIZE 1024
+CHashMap<string, int> g_m1Map;
+string   g_m1Key[M1C_SIZE];
+bool     g_m1Ok[M1C_SIZE];
+int      g_m1Res[M1C_SIZE];
+datetime g_m1Hit[M1C_SIZE];
+int      g_m1Next    = 0;
+bool     g_m1Pending = false;   // M1 history was not ready -> finished boxes are recalculated later
+CHashMap<string, uint> g_m1Wait; // bar key -> tick of the first "not ready"; after 60 s M1 gives up
+#define M1_WAIT_MS 60000
+
+void M1Store(const string key, const bool ok, const int res, const datetime hit)
+  {
+   int k = g_m1Next;
+   g_m1Next = (g_m1Next + 1) % M1C_SIZE;
+   if(g_m1Key[k] != "")
+      g_m1Map.Remove(g_m1Key[k]);
+   g_m1Key[k] = key;
+   g_m1Ok[k]  = ok;
+   g_m1Res[k] = res;
+   g_m1Hit[k] = hit;
+   g_m1Map.TrySetValue(key, k);
+  }
+
+// Looks at the M1 bars inside one chart bar to find what came first.
+// needEntry = the entry bar: the entry must be reached first; inside the entry minute the
+// conservative rule stays (stop counts, target alone does not); Stop and Target in one minute
+// = stop. res: -1 stop first, 1 target first, 0 neither after the entry; tHit = that minute.
+// Returns false when M1 cannot decide: chart is M1 or lower or above D1, M1 history not ready,
+// or the M1 bars do not rebuild the chart bar exactly (open, high, low, close, tick volume).
+bool InsideBar(const SPos &p, const MqlRates &bar, const datetime tEnd, const bool needEntry, int &res, datetime &tHit)
+  {
+   res  = 0;
+   tHit = 0;
+   if(PeriodSeconds() <= 60 || PeriodSeconds() > 86400)
+      return false;
+   bool fin = bar.time < iTime(_Symbol, _Period, 0);   // finished bar -> cacheable
+   string key = StringFormat("%I64d|%I64d|%d|%s|%s|%s|%d", (long)bar.time, (long)tEnd, p.dir,
+                             DoubleToString(p.entry, _Digits), DoubleToString(p.sl, _Digits),
+                             DoubleToString(p.tp, _Digits), needEntry);
+   int ci;
+   if(fin && g_m1Map.TryGetValue(key, ci) && g_m1Key[ci] == key)
+     {
+      res  = g_m1Res[ci];
+      tHit = g_m1Hit[ci];
+      return g_m1Ok[ci];
+     }
+   MqlRates m[];
+   int n = CopyRates(_Symbol, PERIOD_M1, bar.time, tEnd, m);
+   bool synced = (bool)SeriesInfoInteger(_Symbol, PERIOD_M1, SERIES_SYNCHRONIZED);
+   if(n <= 0 || !synced)
+     {
+      // history is being loaded - try again later; a finished bar that never gets M1 data
+      // (outside the available history) is given up after M1_WAIT_MS -> conservative rule
+      if(fin)
+        {
+         uint t0;
+         if(!g_m1Wait.TryGetValue(key, t0))
+            g_m1Wait.Add(key, GetTickCount());
+         else
+            if(GetTickCount() - t0 > M1_WAIT_MS)
+              {
+               g_m1Wait.Remove(key);
+               M1Store(key, false, 0, 0);
+               return false;
+              }
+        }
+      g_m1Pending = true;
+      return false;
+     }
+   if(fin)
+      g_m1Wait.Remove(key);
+   double hi = m[0].high, lo = m[0].low;
+   long   tv = 0;
+   for(int i = 0; i < n; i++)
+     {
+      hi = MathMax(hi, m[i].high);
+      lo = MathMin(lo, m[i].low);
+      tv += m[i].tick_volume;
+     }
+   bool same = MathAbs(m[0].open - bar.open) < _Point * 0.5 && MathAbs(m[n - 1].close - bar.close) < _Point * 0.5 &&
+               MathAbs(hi - bar.high) < _Point * 0.5 && MathAbs(lo - bar.low) < _Point * 0.5 &&
+               tv == bar.tick_volume;
+   if(!same)
+     {
+      if(InpDebug)
+         Print(StringFormat("[PP] M1 does not rebuild bar %s (M1 bars %d, tick volume %I64d vs %I64d) -> conservative rule",
+                            TimeToString(bar.time), n, tv, bar.tick_volume));
+      if(fin)
+         M1Store(key, false, 0, 0);   // synchronized but different -> M1 cannot decide this bar
+      return false;
+     }
+   bool slOn = !IsNone(p.sl, p.entry), tpOn = !IsNone(p.tp, p.entry);
+   bool done = false;
+   int i = 0;
+   if(needEntry)
+     {
+      for(; i < n; i++)
+         if(m[i].low <= p.entry && m[i].high >= p.entry)
+            break;
+      if(i >= n)
+        {
+         if(fin)
+            M1Store(key, false, 0, 0);
+         return false;
+        }
+      if(slOn && (p.dir > 0 ? m[i].low <= p.sl : m[i].high >= p.sl))
+        {
+         res  = -1;
+         tHit = m[i].time;
+         done = true;
+        }
+      i++;
+     }
+   for(; !done && i < n; i++)
+     {
+      bool hs = slOn && (p.dir > 0 ? m[i].low <= p.sl  : m[i].high >= p.sl);
+      bool ht = tpOn && (p.dir > 0 ? m[i].high >= p.tp : m[i].low <= p.tp);
+      if(hs || ht)
+        {
+         res  = hs ? -1 : 1;
+         tHit = m[i].time;
+         done = true;
+        }
+     }
+   if(fin)
+      M1Store(key, true, res, tHit);
+   return true;
+  }
+
 void SimTrade(const SPos &p, STrade &tr)
   {
    ZeroMemory(tr);
@@ -1062,28 +1259,51 @@ void SimTrade(const SPos &p, STrade &tr)
       if(cp > 0)
          tr.exitPrice = cp;
      }
-   // Entry bar: OHLC does not tell whether the stop was touched before or after the entry,
-   // so a stop inside the entry bar counts as hit (conservative). A target inside the entry
-   // bar alone is not counted (it may have been before the entry) - the next bars decide.
-   if(!IsNone(p.sl, p.entry) && (p.dir > 0 ? r[k].low <= p.sl : r[k].high >= p.sl))
+   // Entry bar: OHLC does not tell whether Stop / Target were touched before or after the
+   // entry. The M1 bars inside it decide; when they cannot (no / incomplete M1 history, chart
+   // already M1), stay conservative: a stop inside the entry bar counts as hit, a target inside
+   // the entry bar alone does not (it may have been before the entry) - the next bars decide.
+   bool slK = !IsNone(p.sl, p.entry) && (p.dir > 0 ? r[k].low <= p.sl  : r[k].high >= p.sl);
+   bool tpK = !IsNone(p.tp, p.entry) && (p.dir > 0 ? r[k].high >= p.tp : r[k].low <= p.tp);
+   if(slK || tpK)
      {
-      tr.state     = -1;
-      tr.exitPrice = p.sl;
-      tr.tOut      = r[k].time;
-      tr.closed    = true;
-      return;
+      int res;
+      datetime th;
+      if(InsideBar(p, r[k], BarEnd(r, k, n), true, res, th))
+        {
+         if(res != 0)
+           {
+            SimClose(p, tr, res, r[k].time, th);
+            return;
+           }
+        }
+      else if(slK)
+        {
+         SimClose(p, tr, -1, r[k].time);
+         return;
+        }
      }
    for(int j = k + 1; j < n; j++)
      {
-      // same bar touching both -> count as stop (conservative); a "none" level (= entry) never hits
+      // a "none" level (= entry) never hits
       bool hitSL = !IsNone(p.sl, p.entry) && (p.dir > 0 ? r[j].low <= p.sl  : r[j].high >= p.sl);
       bool hitTP = !IsNone(p.tp, p.entry) && (p.dir > 0 ? r[j].high >= p.tp : r[j].low <= p.tp);
+      if(hitSL && hitTP)
+        {
+         // both in one bar: the M1 bars decide, otherwise stop (conservative)
+         int res;
+         datetime th;
+         if(!InsideBar(p, r[j], BarEnd(r, j, n), false, res, th) || res == 0)
+           {
+            res = -1;
+            th  = 0;
+           }
+         SimClose(p, tr, res, r[j].time, th);
+         return;
+        }
       if(hitSL || hitTP)
         {
-         tr.state     = hitSL ? -1 : 1;
-         tr.exitPrice = hitSL ? p.sl : p.tp;
-         tr.tOut      = r[j].time;
-         tr.closed    = true;
+         SimClose(p, tr, hitSL ? -1 : 1, r[j].time);
          return;
         }
      }
@@ -1479,9 +1699,9 @@ void UpdateAllBadges()
 //| Panel                                                            |
 //+------------------------------------------------------------------+
 // Panel layout: key order + widths. A small extra gap separates the navigation group.
-string g_btnKeys[] = {"LONG", "SHORT", "LOCK", "HIDE", "STATS", "EXPORT", "CLEAR", "PREV", "CNT", "NEXT"};
-int    g_btnW[]    = {BTN_W,  BTN_W,   BTN_W,  BTN_W,  BTN_W,   BTN_W,    64,      24,     50,    24};
-int    g_btnN      = 10;     // buttons in the current layout (static arrays, so a counter instead of resizing)
+string g_btnKeys[] = {"LONG", "SHORT", "LOCK", "HIDE", "STATS", "EXPORT", "RESTORE", "CLEAR", "PREV", "CNT", "NEXT"};
+int    g_btnW[]    = {BTN_W,  BTN_W,   BTN_W,  BTN_W,  BTN_W,   BTN_W,    BTN_W,     64,      24,     50,    24};
+int    g_btnN      = 11;     // buttons in the current layout (static arrays, so a counter instead of resizing)
 #define NAV_EXTRA_GAP 8
 
 int BtnIndex(const string key)
@@ -1586,6 +1806,7 @@ void CreatePanel()
    MakeButton("HIDE", "Hide",   cBtn, cBtnText, "Hide / show all positions");
    MakeButton("STATS", "Stats",  cBtn, cBtnText, "Show / hide statistics of all boxes on the chart");
    MakeButton("EXPORT", "Export", cBtn, cBtnText, "Export boxes and their simulated results to JSON (MQL5\\Files\\PositionPlanner)");
+   MakeButton("RESTORE", "Restore", cBtn, cBtnText, "Restore boxes from the newest backup / export of this symbol and timeframe (click twice)");
    MakeButton("CLEAR", "Clear all", cBtn, cBtnText, "Delete ALL positions (click twice). Active box: Delete key");
    MakeButton("PREV", "◄",      cBtn, cBtnText, "Previous box on the chart (by time)");
    MakeButton("CNT", "0",      cBtn, cBtnText, "Active box / number of boxes - click to jump to the active box");
@@ -1603,6 +1824,11 @@ void UpdatePanel()
    if(!armed)
       g_clearArmed = 0;
    ObjectSetString(0, UIP + "CLEAR", OBJPROP_TEXT, armed ? "Sure?" : "Clear all");
+   bool rArmed = g_restArmed != 0 && (GetTickCount() - g_restArmed) < RESTORE_ARM_MS;
+   if(!rArmed)
+      g_restArmed = 0;
+   if(ObjectFind(0, UIP + "RESTORE") >= 0)
+      ObjectSetString(0, UIP + "RESTORE", OBJPROP_TEXT, rArmed ? "Sure?" : "Restore");
    ObjectSetString(0, UIP + "LONG",  OBJPROP_TEXT, g_placeDir > 0 ? "Click..." : "Long");
    ObjectSetString(0, UIP + "SHORT", OBJPROP_TEXT, g_placeDir < 0 ? "Click..." : "Short");
    ObjectSetInteger(0, UIP + "LONG",  OBJPROP_STATE, g_placeDir > 0);
@@ -1646,8 +1872,87 @@ void PlaceStats()
    ObjectSetInteger(0, STATS_OBJ, OBJPROP_ZORDER, 100);
   }
 
+// Last second of the chart bar that opens at t (next bar's open - 1; months of any length).
+datetime BarEndTime(const datetime t)
+  {
+   int sh = iBarShift(_Symbol, _Period, t, true);
+   if(sh > 0)
+     {
+      datetime nx = iTime(_Symbol, _Period, sh - 1);
+      if(nx > t)
+         return (datetime)((long)nx - 1);
+     }
+   return (datetime)((long)t + PeriodSeconds() - 1);
+  }
+
+// Worst possible maximum drawdown of results v[] (sorted by exit interval start a[]; b[] = end).
+// Overlapping exit intervals form a group with unknown order. For each group with start total
+// E, wins W and losses L: highest point E + W (wins first), lowest point E - L (losses first),
+// and both can happen in different groups at once -> worst DD = max(L of a group,
+// highest point of an earlier group - lowest point of a later group, 0 - lowest point).
+// A group joined through a chain of overlaps is treated as freely ordered, so the result is an
+// upper bound: the real drawdown is never higher, in rare chained cases it can be lower.
+// uncertain = some group holds both a win and a loss (order matters).
+double WorstDrawdown(const datetime &a[], const datetime &b[], const double &v[], bool &uncertain)
+  {
+   int n = ArraySize(v);
+   double E = 0, peak = 0, dd = 0;
+   int i = 0;
+   while(i < n)
+     {
+      datetime end = b[i];
+      double W = 0, L = 0;
+      int j = i;
+      while(j < n && (j == i || a[j] <= end))
+        {
+         if(b[j] > end)
+            end = b[j];
+         if(v[j] > 0)
+            W += v[j];
+         else
+            L -= v[j];
+         j++;
+        }
+      if(W > 0 && L > 0 && j - i > 1)
+         uncertain = true;
+      dd   = MathMax(dd, MathMax(L, peak - (E - L)));
+      peak = MathMax(peak, E + W);
+      E   += W - L;
+      i = j;
+     }
+   return dd;
+  }
+
+// 200 s -> "3 min", 11700 s -> "3 h 15 min", 2 days -> "2 d 0 h"
+string FmtDuration(const double sec)
+  {
+   long s = (long)MathRound(sec);
+   if(s < 3600)
+      return IntegerToString(s / 60) + " min";
+   if(s < 86400)
+      return StringFormat("%I64d h %02I64d min", s / 3600, (s % 3600) / 60);
+   return StringFormat("%I64d d %I64d h", s / 86400, (s % 86400) / 3600);
+  }
+
 void UpdateStats()
   {
+   // armed Restore: the stats box asks the question instead (no modal window)
+   if(g_restArmed != 0 && (GetTickCount() - g_restArmed) < RESTORE_ARM_MS && g_restFile != "")
+     {
+      string f = g_restFile;
+      StringReplace(f, "PositionPlanner\\", "");
+      string q[3];
+      q[0] = StringFormat("Restore %d of %d box(es)?", g_restFresh, g_restTotal);
+      q[1] = "from  " + f;
+      q[2] = StringFormat("Click Restore again (%d s) to confirm", RESTORE_ARM_MS / 1000);
+      BuildBadge(STATS_OBJ, q, C'30,34,45', C'90,95,110', false, InpFontSize + 1, g_statsW, g_statsH);
+      ObjectSetInteger(0, STATS_OBJ, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
+      bool was = g_showStats;
+      g_showStats = true;        // PlaceStats only places a shown box
+      PlaceStats();
+      g_showStats = was;
+      return;
+     }
    if(!g_showStats)
      {
       if(ObjectFind(0, STATS_OBJ) >= 0)
@@ -1657,6 +1962,15 @@ void UpdateStats()
    int n = ArraySize(g_pos), trig = 0, tp = 0, sl = 0, be = 0, open = 0, unk = 0;
    double totR = 0, totUsd = 0;
    bool   usdOk = true;   // every counted trade has a money result
+   datetime cT[], cB[];    // closed trades: exit time interval (from, to), R, money, money known
+   double   cR[], cM[];
+   bool     cOk[];
+   bool     ddRok = true;
+   double   durSum = 0;
+   int      durN = 0;
+   bool     durBar = false; // some durations come from bar times (simulated boxes)
+   int ids[], openNo[];   // open boxes by their number in the panel counter (time order)
+   SortedIds(ids);
    for(int i = 0; i < n; i++)
      {
       SPos p = g_pos[i];
@@ -1671,7 +1985,16 @@ void UpdateStats()
          continue;
       trig++;
       if(!tr.closed)
+        {
          open++;
+         for(int k = 0; k < n; k++)
+            if(ids[k] == p.id)
+              {
+               int m = ArraySize(openNo);
+               ArrayResize(openNo, m + 1);
+               openNo[m] = k + 1;
+              }
+        }
       else
          if(tr.state > 0)
             tp++;
@@ -1680,31 +2003,117 @@ void UpdateStats()
                sl++;
             else
                be++;
-      if(!IsNone(p.sl, p.entry))
-         totR += (tr.exitPrice - p.entry) * p.dir / MathAbs(p.entry - p.sl);
+      double rMul = !IsNone(p.sl, p.entry) ? (tr.exitPrice - p.entry) * p.dir / MathAbs(p.entry - p.sl) : 0;
+      totR += rMul;
+      double mon = 0;
+      bool   monOk = true;
       if(tr.real)
-         totUsd += Money2(tr.pnl);                       // real money incl. costs
+         mon = Money2(tr.pnl);                           // real money incl. costs
       else
         {
          SCalc c;
          Calc(p, c);
          if(c.ok)
-            totUsd += Money2(MoneyPerLot(p.dir, p.entry, tr.exitPrice) * c.lots);   // sum of rounded trades, like a statement
+            mon = Money2(MoneyPerLot(p.dir, p.entry, tr.exitPrice) * c.lots);   // sum of rounded trades, like a statement
          else
-            usdOk = false;
+            monOk = false;
+        }
+      if(monOk)
+         totUsd += mon;
+      else
+         usdOk = false;
+      if(tr.closed)
+        {
+         // closed trades for drawdown (in exit order) and average time in trade
+         datetime tI = tr.real ? tr.tInExact : tr.tIn, tO = tr.real ? tr.tOutExact : tr.tOut;
+         // when the exit happened, as far as it is known: real = exact, M1 = that minute, else the bar
+         datetime tA = tr.real ? tr.tOutExact : tr.tExit;
+         datetime tB = tr.real ? tA : (tr.exitMin ? (datetime)((long)tA + 59) : BarEndTime(tA));
+         int m = ArraySize(cT);
+         ArrayResize(cT, m + 1);
+         ArrayResize(cB, m + 1);
+         ArrayResize(cR, m + 1);
+         ArrayResize(cM, m + 1);
+         ArrayResize(cOk, m + 1);
+         if(IsNone(p.sl, p.entry))
+            ddRok = false;          // no stop -> no R for this trade -> no drawdown in R
+         cT[m] = tA;
+         cB[m] = tB;
+         cR[m] = rMul;
+         cM[m] = mon;
+         cOk[m] = monOk;
+         if(tO >= tI && tI > 0)
+           {
+            durSum += (double)((long)tO - (long)tI);
+            durN++;
+            if(!tr.real)
+               durBar = true;
+           }
         }
      }
+   // max drawdown: largest fall of the running total from its peak (start = 0), closed trades
+   // in exit order. Trades whose exit times overlap (same bar / minute, order not known) form a
+   // group; the worst possible order inside every group is taken -> exact worst case.
+   int nc = ArraySize(cT);
+   for(int i = 1; i < nc; i++)   // insertion sort by the start of the exit interval
+     {
+      datetime t = cT[i], tb = cB[i];
+      double r = cR[i], mo = cM[i];
+      bool ok = cOk[i];
+      int j = i - 1;
+      while(j >= 0 && cT[j] > t)
+        {
+         cT[j + 1] = cT[j];
+         cB[j + 1] = cB[j];
+         cR[j + 1] = cR[j];
+         cM[j + 1] = cM[j];
+         cOk[j + 1] = cOk[j];
+         j--;
+        }
+      cT[j + 1] = t;
+      cB[j + 1] = tb;
+      cR[j + 1] = r;
+      cM[j + 1] = mo;
+      cOk[j + 1] = ok;
+     }
+   bool ddMOk = true, ddWorst = false;
+   for(int i = 0; i < nc; i++)
+      if(!cOk[i])
+         ddMOk = false;
+   double ddR = WorstDrawdown(cT, cB, cR, ddWorst);
+   bool   wM  = false;
+   double ddM = WorstDrawdown(cT, cB, cM, wM);
+   ddWorst = ddWorst || wM;
    string sep = "   ·   ";
    string cur = AccountInfoString(ACCOUNT_CURRENCY);
-   string lines[4];
+   string lines[];
+   ArrayResize(lines, open > 0 ? 7 : 6);
    lines[0] = StringFormat("Boxes %d%striggered %d%snot triggered %d", n, sep, trig, sep, n - trig - unk) +
               (unk > 0 ? StringFormat("%sn/a %d", sep, unk) : "");
    lines[1] = StringFormat("Win %d%sLoss %d%sBE %d%sopen %d", tp, sep, sl, sep, be, sep, open);
    lines[2] = (tp + sl) > 0 ? StringFormat("Win rate  %.1f %%", 100.0 * tp / (tp + sl)) : "Win rate  -";
    lines[3] = StringFormat("Total  %s%.2f R%s", totR >= 0 ? "+" : "", totR, sep) +
               (usdOk ? StringFormat("%s%.2f %s", totUsd >= 0 ? "+" : "", totUsd, cur) : "money n/a");
+   lines[4] = nc > 0 ? "Max drawdown  " + (ddRok ? StringFormat("-%.2f R", ddR) : "R n/a") + sep +
+                       (ddMOk ? StringFormat("-%.2f %s", ddM, cur) : "money n/a") +
+                       (ddWorst ? "  (worst case)" : "")
+                     : "Max drawdown  -";
+   lines[5] = durN > 0 ? "Avg time in trade  " + (durBar ? "~" : "") + FmtDuration(durSum / durN)
+                       : "Avg time in trade  -";
+   if(open > 0)
+     {
+      // which boxes are open: the same numbers as the panel counter  ◄ n / total ►
+      ArraySort(openNo);
+      int no = ArraySize(openNo), show = MathMin(no, 10);
+      string l = "Open boxes  ";
+      for(int k = 0; k < show; k++)
+         l += (k > 0 ? ", " : "") + IntegerToString(openNo[k]);
+      if(no > show)
+         l += StringFormat(" … (+%d)", no - show);
+      lines[6] = l + "   (◄ n / " + IntegerToString(n) + " ►)";
+     }
 
-   BuildBadge(STATS_OBJ, lines, C'30,34,45', C'90,95,110', false, InpFontSize + 1, g_statsW, g_statsH);
+   BuildBadge(STATS_OBJ, lines, C'30,34,45', C'90,95,110', false, InpFontSize + 1, g_statsW, g_statsH, 3);   // Total
    PlaceStats();
   }
 
@@ -1837,6 +2246,8 @@ void ExportJson(const int onlyId = 0)
    FileWriteString(h, "  \"exported_local\": " + JTime(TimeLocal()) + ",\n");
    FileWriteString(h, "  \"times_are\": \"broker server time\",\n");
    FileWriteString(h, "  \"symbol\": " + JStr(_Symbol) + ",\n");
+   FileWriteString(h, "  \"account\": " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",\n");
+   FileWriteString(h, "  \"server\": " + JStr(AccountInfoString(ACCOUNT_SERVER)) + ",\n");
    FileWriteString(h, "  \"timeframe\": " + JStr(tf) + ",\n");
    FileWriteString(h, "  \"digits\": " + IntegerToString(_Digits) + ",\n");
    FileWriteString(h, "  \"point\": " + JNum(_Point, _Digits) + ",\n");
@@ -2583,18 +2994,16 @@ void DoDrag(const int x, const int y)
    double np = SnapPrice(NormPrice(pr));
    switch(g_drag.hit)
      {
-      // left handles: change the level (height) and the left edge (width)
+      // left corner handles: level only (height), like TradingView - the time edges
+      // are changed by the Entry circle (left edge) and the right middle handle (width)
       case HIT_H_TP:
          ApplyTP(p, np);
-         if(t < p.t2)
-            p.t1 = t;
          break;
       case HIT_H_SL:
          if(p.dir > 0 ? np < p.entry : np > p.entry)
             p.sl = np;
-         if(t < p.t2)
-            p.t1 = t;
          break;
+      // left middle (Entry circle): entry price and the left edge
       case HIT_H_E:
          if(p.dir > 0 ? (np > p.sl && np < p.tp) : (np < p.sl && np > p.tp))
             p.entry = np;
@@ -2649,7 +3058,10 @@ void DoDrag(const int x, const int y)
       Dbg(StringFormat("id=%d flipped to %s", p.id, p.dir > 0 ? "LONG" : "SHORT"));
      }
    g_pos[i] = p;
-   Crosshair(true, DragLevel(p, g_drag.hit), g_drag.hit == HIT_BODY ? p.t1 : t);
+   // the vertical crosshair line follows the time actually set: corner handles (level only)
+   // and the body keep it on the left edge, Entry / width handles follow the mouse
+   bool atLeft = (g_drag.hit == HIT_BODY || g_drag.hit == HIT_H_TP || g_drag.hit == HIT_H_SL);
+   Crosshair(true, DragLevel(p, g_drag.hit), atLeft ? p.t1 : t);
    DrawPos(p);
    ChartRedraw();
   }
@@ -2795,12 +3207,590 @@ void LoadFromChart()
                     n, ArraySize(foreign), ArraySize(junk), g_hidden));
   }
 
+
+//+------------------------------------------------------------------+
+//| Backup / Restore                                                 |
+//+------------------------------------------------------------------+
+// Backup (input InpAutoBackup): after every change the boxes of this chart are written to
+// PositionPlanner\backup\<account>_<symbol>_<TF>.json (levels, times, lock, linked position).
+// The file is written to a .tmp first, read back and checked, and only then replaces the
+// backup - a crash while writing never destroys the last good backup.
+// Before the first write of an indicator instance, a backup holding boxes that are not on this
+// chart (e.g. a chart lost in a crash) is kept as ..._prev_<time>.json (the newest PREV_KEEP).
+// Restore: the newest complete backup / previous backup / full export (not "locked only",
+// not single box) of this symbol + timeframe that has boxes not on the chart yet.
+#define PREV_KEEP 5
+
+string TfName() { return StringSubstr(EnumToString(_Period), 7); }   // PERIOD_M5 -> M5
+string BakName() { return IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" + SafeFileName(_Symbol) + "_" + TfName(); }
+string BakDir()  { return "PositionPlanner\\backup\\"; }
+string BakBase() { return BakDir() + BakName(); }
+
+string BoxesSig()
+  {
+   string r = "";
+   for(int i = 0; i < ArraySize(g_pos); i++)
+     {
+      SPos p = g_pos[i];
+      r += StringFormat("%d|%d|%s|%s|%s|%I64d|%I64d|%d|%I64d;", p.id, p.dir,
+                        DoubleToString(p.entry, _Digits), DoubleToString(p.sl, _Digits), DoubleToString(p.tp, _Digits),
+                        (long)p.t1, (long)p.t2, p.locked, p.ticket);
+     }
+   return r;
+  }
+
+bool SameBoxLv(const SPos &a, const SPos &b)
+  {
+   if(a.ticket > 0 || b.ticket > 0)
+      return a.ticket == b.ticket;
+   return a.dir == b.dir && a.t1 == b.t1 && a.t2 == b.t2 &&
+          MathAbs(a.entry - b.entry) < _Point * 0.5 && MathAbs(a.sl - b.sl) < _Point * 0.5 &&
+          MathAbs(a.tp - b.tp) < _Point * 0.5;
+  }
+
+bool OnChartAlready(const SPos &b)
+  {
+   for(int i = 0; i < ArraySize(g_pos); i++)
+      if(SameBoxLv(g_pos[i], b))
+         return true;
+   return false;
+  }
+
+// "2026-10-08T23:30:00" -> datetime (0 = invalid)
+datetime JParseTime(string v)
+  {
+   if(StringLen(v) < 19)
+      return 0;
+   StringReplace(v, "-", ".");
+   StringReplace(v, "T", " ");
+   return StringToTime(v);
+  }
+
+// Reads the boxes of a PositionPlanner export / backup file (our own one-key-per-line format;
+// boxes are the objects at depth 3 of "boxes"). The whole file is rejected when it is not
+// complete (truncated), not for this symbol, or any box is incomplete / invalid.
+// lockedOnly = export of locked boxes only. Linked boxes of another account lose the link.
+bool ReadBoxesFile(const string file, SPos &out[], string &err, bool &lockedOnly)
+  {
+   ArrayResize(out, 0);
+   lockedOnly = false;
+   int h = FileOpen(file, FILE_READ | FILE_TXT | FILE_ANSI, 0, CP_UTF8);
+   if(h == INVALID_HANDLE)
+     {
+      err = "cannot open (error " + IntegerToString(GetLastError()) + ")";
+      return false;
+     }
+   int depth = 0;
+   bool started = false, ended = false, inBoxes = false, boxesDone = false, inBox = false, symOk = false, bad = false;
+   long acc = -1;
+   string srv = "";
+   SPos b;
+   ZeroMemory(b);
+   bool hasStop = false, hasTarget = false;
+   int  got = 0;                 // required box fields seen (bit mask)
+   while(!FileIsEnding(h))
+     {
+      string ln = FileReadString(h);
+      StringTrimLeft(ln);
+      StringTrimRight(ln);
+      if(ln == "")
+         continue;
+      if(ended)
+        {
+         bad = true;             // content after the end of the document
+         break;
+        }
+      string key = "", val = "";
+      if(StringGetCharacter(ln, 0) == '"')
+        {
+         int q = StringFind(ln, "\"", 1);
+         int c = q > 0 ? StringFind(ln, ":", q) : -1;
+         if(c > 0)
+           {
+            key = StringSubstr(ln, 1, q - 1);
+            val = StringSubstr(ln, c + 1);
+            StringTrimLeft(val);
+            StringTrimRight(val);
+            if(StringLen(val) > 0 && StringGetCharacter(val, StringLen(val) - 1) == ',')
+               val = StringSubstr(val, 0, StringLen(val) - 1);
+            if(StringLen(val) >= 2 && StringGetCharacter(val, 0) == '"')
+               val = StringSubstr(val, 1, StringLen(val) - 2);
+           }
+        }
+      if(depth == 1 && key == "symbol")
+        {
+         if(val != _Symbol)
+           {
+            FileClose(h);
+            err = "file is for " + val;
+            return false;
+           }
+         symOk = true;
+        }
+      if(depth == 1 && key == "account")
+         acc = StringToInteger(val);
+      if(depth == 1 && key == "server")
+         srv = val;
+      if(depth == 1 && key == "locked_only")
+         lockedOnly = (val == "true");
+      if(depth == 1 && key == "boxes")
+         inBoxes = true;
+      if(inBoxes && depth == 2 && (ln == "{" || ln == "{,"))
+        {
+         inBox = true;
+         ZeroMemory(b);
+         hasStop = hasTarget = false;
+         got = 0;
+        }
+      if(inBox && depth == 3 && key != "")
+        {
+         if(key == "position_id")
+           {
+            b.ticket = (val == "null") ? 0 : StringToInteger(val);
+            got |= 1;
+           }
+         else if(key == "direction")
+           {
+            b.dir = (val == "long") ? 1 : (val == "short" ? -1 : 0);
+            got |= 2;
+           }
+         else if(key == "locked")
+            b.locked = (val == "true");
+         else if(key == "entry")
+           {
+            b.entry = NormPrice(StringToDouble(val));
+            got |= 4;
+           }
+         else if(key == "stop")
+           {
+            if(val != "null")
+              {
+               b.sl = NormPrice(StringToDouble(val));
+               hasStop = true;
+              }
+            got |= 8;
+           }
+         else if(key == "target")
+           {
+            if(val != "null")
+              {
+               b.tp = NormPrice(StringToDouble(val));
+               hasTarget = true;
+              }
+            got |= 16;
+           }
+         else if(key == "time_start")
+           {
+            b.t1 = JParseTime(val);
+            got |= 32;
+           }
+         else if(key == "time_end")
+           {
+            b.t2 = JParseTime(val);
+            got |= 64;
+           }
+        }
+      // depth after this line (our strings never contain braces; brackets in symbols come in pairs)
+      for(int k = 0; k < StringLen(ln); k++)
+        {
+         ushort ch = StringGetCharacter(ln, k);
+         if(ch == '{' || ch == '[')
+           {
+            depth++;
+            started = true;
+           }
+         else if(ch == '}' || ch == ']')
+            depth--;
+        }
+      if(depth < 0)
+        {
+         bad = true;
+         break;
+        }
+      if(inBox && depth == 2)
+        {
+         inBox = false;
+         if(!hasStop)
+            b.sl = b.entry;     // "none" level = entry
+         if(!hasTarget)
+            b.tp = b.entry;
+         // a linked box takes the real SL / TP, which may be past the entry (trailing / break-even)
+         bool lk = b.ticket > 0;
+         bool ok = got == 127 && (b.dir == 1 || b.dir == -1) && b.entry > 0 && b.t1 > 0 && b.t2 > b.t1 && b.ticket >= 0 &&
+                   (!hasStop || (b.sl > 0 && (lk || (b.dir > 0 ? b.sl < b.entry : b.sl > b.entry)))) &&
+                   (!hasTarget || (b.tp > 0 && (lk || (b.dir > 0 ? b.tp > b.entry : b.tp < b.entry))));
+         if(!ok)
+           {
+            bad = true;
+            break;
+           }
+         int n = ArraySize(out);
+         ArrayResize(out, n + 1);
+         out[n] = b;
+        }
+      if(inBoxes && depth <= 1)
+        {
+         inBoxes = false;
+         boxesDone = true;
+        }
+      if(started && depth == 0)
+         ended = true;
+     }
+   FileClose(h);
+   if(bad || !ended || !boxesDone)
+     {
+      ArrayResize(out, 0);
+      err = "file is incomplete or damaged";
+      return false;
+     }
+   if(!symOk)
+     {
+      ArrayResize(out, 0);
+      err = "not a PositionPlanner file";
+      return false;
+     }
+   // position ids of another account / server mean nothing here -> normal boxes. Older files
+   // without the account are taken as this account's (they were written by this terminal).
+   if((acc >= 0 && acc != AccountInfoInteger(ACCOUNT_LOGIN)) || (srv != "" && srv != AccountInfoString(ACCOUNT_SERVER)))
+     {
+      int w = 0;
+      for(int k = 0; k < ArraySize(out); k++)
+        {
+         SPos x = out[k];
+         if(x.ticket > 0)
+           {
+            x.ticket = 0;
+            // a real trailing / break-even level past the entry is not valid for a normal box
+            if((!IsNone(x.sl, x.entry) && (x.dir > 0 ? x.sl >= x.entry : x.sl <= x.entry)) ||
+               (!IsNone(x.tp, x.entry) && (x.dir > 0 ? x.tp <= x.entry : x.tp >= x.entry)))
+              {
+               Print("PositionPlanner: restore skips a box of another account (its real stop / target is past the entry)");
+               continue;
+              }
+           }
+         out[w++] = x;
+        }
+      ArrayResize(out, w);
+     }
+   return true;
+  }
+
+int CountNew(const SPos &bx[])
+  {
+   int c = 0;
+   for(int k = 0; k < ArraySize(bx); k++)
+      if(!OnChartAlready(bx[k]))
+         c++;
+   return c;
+  }
+
+void AddCand(string &cand[], datetime &when[], const string f)
+  {
+   int n = ArraySize(cand);
+   ArrayResize(cand, n + 1);
+   ArrayResize(when, n + 1);
+   cand[n] = f;
+   when[n] = (datetime)FileGetInteger(f, FILE_MODIFY_DATE);
+  }
+
+// files folder\pattern -> names (without the folder)
+void ListFiles(const string folder, const string pattern, string &names[])
+  {
+   ArrayResize(names, 0);
+   string fn;
+   long fh = FileFindFirst(folder + pattern, fn);
+   if(fh == INVALID_HANDLE)
+      return;
+   do
+     {
+      int n = ArraySize(names);
+      ArrayResize(names, n + 1);
+      names[n] = fn;
+     }
+   while(FileFindNext(fh, fn));
+   FileFindClose(fh);
+  }
+
+// Newest complete backup / export of this symbol + timeframe with boxes not on the chart.
+string FindRestoreFile(int &total, int &fresh)
+  {
+   string cand[];
+   datetime when[];
+   string names[];
+   if(FileIsExist(BakBase() + ".json"))
+      AddCand(cand, when, BakBase() + ".json");
+   ListFiles(BakDir(), BakName() + "_prev_*.json", names);
+   for(int k = 0; k < ArraySize(names); k++)
+      AddCand(cand, when, BakDir() + names[k]);
+   ListFiles("PositionPlanner\\", SafeFileName(_Symbol) + "_" + TfName() + "_*.json", names);
+   for(int k = 0; k < ArraySize(names); k++)
+      if(StringFind(names[k], "_box") < 0)          // single-box exports are not a chart state
+         AddCand(cand, when, "PositionPlanner\\" + names[k]);
+   int n = ArraySize(cand);
+   for(int i = 1; i < n; i++)                         // newest first
+     {
+      string c = cand[i];
+      datetime w = when[i];
+      int j = i - 1;
+      while(j >= 0 && when[j] < w)
+        {
+         cand[j + 1] = cand[j];
+         when[j + 1] = when[j];
+         j--;
+        }
+      cand[j + 1] = c;
+      when[j + 1] = w;
+     }
+   for(int i = 0; i < n; i++)
+     {
+      SPos bx[];
+      string err;
+      bool lockedOnly;
+      if(!ReadBoxesFile(cand[i], bx, err, lockedOnly))
+        {
+         Print("PositionPlanner: restore skips ", cand[i], " - ", err);
+         continue;
+        }
+      if(lockedOnly)
+         continue;                                    // only part of the chart
+      int c = CountNew(bx);
+      if(c > 0)
+        {
+         total = ArraySize(bx);
+         fresh = c;
+         return cand[i];
+        }
+     }
+   return "";
+  }
+
+void RestoreClick()
+  {
+   if(g_restArmed != 0 && (GetTickCount() - g_restArmed) < RESTORE_ARM_MS && g_restFile != "")
+     {
+      g_restArmed = 0;
+      SPos bx[];
+      string err;
+      bool lockedOnly;
+      if(!ReadBoxesFile(g_restFile, bx, err, lockedOnly))
+        {
+         Alert("PositionPlanner: restore failed - ", g_restFile, ": ", err);
+         g_restFile = "";
+         return;
+        }
+      SetHidden(false);
+      int added = 0;
+      for(int k = 0; k < ArraySize(bx); k++)
+        {
+         SPos p = bx[k];
+         if(OnChartAlready(p))
+            continue;
+         p.id = g_nextId++;      // new id: old ids may belong to other boxes now
+         int n = ArraySize(g_pos);
+         ArrayResize(g_pos, n + 1);
+         g_pos[n] = p;
+         DrawPos(p);
+         added++;
+        }
+      Print("PositionPlanner: restored ", added, " box(es) from ", g_restFile);
+      g_restFile = "";
+      UpdatePanel();
+      ChartRedraw();
+      return;
+     }
+   int total = 0, fresh = 0;
+   g_restFile = FindRestoreFile(total, fresh);
+   if(g_restFile == "")
+     {
+      g_restArmed = 0;
+      Alert("PositionPlanner: nothing to restore for ", _Symbol, " ", TfName(),
+            " - no backup / export with boxes that are not on the chart yet");
+      return;
+     }
+   g_restArmed = GetTickCount();
+   g_restTotal = total;
+   g_restFresh = fresh;
+   Print(StringFormat("PositionPlanner: Restore armed - %d of %d box(es) from %s", fresh, total, g_restFile));
+  }
+
+bool WStr(const int h, const string v, bool &ok)
+  {
+   if(ok && FileWriteString(h, v) <= 0)
+      ok = false;
+   return ok;
+  }
+
+// Writes the backup to a .tmp, reads it back, then replaces the backup file.
+bool WriteBackup(const string file)
+  {
+   string tmp = BakBase() + ".tmp";
+   int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI, 0, CP_UTF8);
+   if(h == INVALID_HANDLE)
+      return false;
+   bool ok = true;
+   WStr(h, "{\n", ok);
+   WStr(h, "  \"schema_version\": 1,\n", ok);
+   WStr(h, "  \"tool\": \"PositionPlanner\",\n", ok);
+   WStr(h, "  \"kind\": \"backup\",\n", ok);
+   WStr(h, "  \"saved_local\": " + JTime(TimeLocal()) + ",\n", ok);
+   WStr(h, "  \"times_are\": \"broker server time\",\n", ok);
+   WStr(h, "  \"symbol\": " + JStr(_Symbol) + ",\n", ok);
+   WStr(h, "  \"account\": " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ",\n", ok);
+   WStr(h, "  \"server\": " + JStr(AccountInfoString(ACCOUNT_SERVER)) + ",\n", ok);
+   WStr(h, "  \"timeframe\": " + JStr(TfName()) + ",\n", ok);
+   WStr(h, "  \"boxes\": [", ok);
+   int ids[];
+   SortedIds(ids);
+   int cnt = 0;
+   for(int k = 0; k < ArraySize(ids); k++)
+     {
+      int i = FindPos(ids[k]);
+      if(i < 0)
+         continue;
+      SPos p = g_pos[i];
+      string b = (cnt > 0 ? "," : "") + "\n    {\n";
+      b += "      \"id\": " + IntegerToString(p.id) + ",\n";
+      b += "      \"source\": " + JStr(p.ticket > 0 ? "trade" : "manual") + ",\n";
+      b += "      \"position_id\": " + (p.ticket > 0 ? IntegerToString(p.ticket) : "null") + ",\n";
+      b += "      \"direction\": " + JStr(p.dir > 0 ? "long" : "short") + ",\n";
+      b += "      \"locked\": " + (p.locked ? "true" : "false") + ",\n";
+      b += "      \"entry\": " + JNum(p.entry, _Digits) + ",\n";
+      b += "      \"stop\": " + (IsNone(p.sl, p.entry) ? "null" : JNum(p.sl, _Digits)) + ",\n";
+      b += "      \"target\": " + (IsNone(p.tp, p.entry) ? "null" : JNum(p.tp, _Digits)) + ",\n";
+      b += "      \"time_start\": " + JTime(p.t1) + ",\n";
+      b += "      \"time_end\": " + JTime(p.t2) + "\n";
+      b += "    }";
+      WStr(h, b, ok);
+      cnt++;
+     }
+   WStr(h, (cnt > 0 ? "\n  " : "") + "]\n}\n", ok);
+   FileFlush(h);
+   FileClose(h);
+   // read back: complete and the same number of boxes
+   SPos chk[];
+   string err;
+   bool lo;
+   if(!ok || !ReadBoxesFile(tmp, chk, err, lo) || ArraySize(chk) != cnt)
+     {
+      FileDelete(tmp);
+      return false;
+     }
+   return FileMove(tmp, 0, file, FILE_REWRITE);
+  }
+
+// Keep the newest PREV_KEEP previous backups, delete older ones.
+void PrunePrev()
+  {
+   string names[];
+   ListFiles(BakDir(), BakName() + "_prev_*.json", names);
+   int n = ArraySize(names);
+   if(n <= PREV_KEEP)
+      return;
+   ArraySort(names);            // ..._prev_YYYYMMDD_HHMMSS.json -> oldest first
+   for(int k = 0; k < n - PREV_KEEP; k++)
+      FileDelete(BakDir() + names[k]);
+  }
+
+// Every saved field equal (direction, levels, times, lock, link)?
+bool SameBoxFull(const SPos &a, const SPos &b)
+  {
+   return a.dir == b.dir && a.t1 == b.t1 && a.t2 == b.t2 && a.locked == b.locked && a.ticket == b.ticket &&
+          MathAbs(a.entry - b.entry) < _Point * 0.5 && MathAbs(a.sl - b.sl) < _Point * 0.5 &&
+          MathAbs(a.tp - b.tp) < _Point * 0.5;
+  }
+
+// Same boxes (all saved fields) in both sets?
+bool SameBoxSet(const SPos &a[], const SPos &b[])
+  {
+   if(ArraySize(a) != ArraySize(b))
+      return false;
+   for(int i = 0; i < ArraySize(a); i++)
+     {
+      bool f = false;
+      for(int j = 0; j < ArraySize(b) && !f; j++)
+         f = SameBoxFull(a[i], b[j]);
+      if(!f)
+         return false;
+     }
+   return true;
+  }
+
+// The newest kept previous backup already holds exactly these boxes?
+bool SameAsNewestPrev(const SPos &bx[])
+  {
+   string names[];
+   ListFiles(BakDir(), BakName() + "_prev_*.json", names);
+   if(ArraySize(names) == 0)
+      return false;
+   ArraySort(names);
+   SPos last[];
+   string err;
+   bool lo;
+   return ReadBoxesFile(BakDir() + names[ArraySize(names) - 1], last, err, lo) && SameBoxSet(bx, last);
+  }
+
+// ..._prev_YYYYMMDD_HHMMSS[_n].json that does not exist yet (never overwrites a kept backup)
+string NewPrevName()
+  {
+   string stamp = TimeToString(TimeLocal(), TIME_DATE | TIME_SECONDS);
+   StringReplace(stamp, ".", "");
+   StringReplace(stamp, ":", "");
+   StringReplace(stamp, " ", "_");
+   for(int k = 0; k < 100; k++)
+     {
+      string f = BakBase() + "_prev_" + stamp + (k > 0 ? StringFormat("_%02d", k) : "") + ".json";
+      if(!FileIsExist(f))
+         return f;
+     }
+   return "";
+  }
+
+void MaybeBackup()
+  {
+   string sig = BoxesSig();
+   if(sig == g_bakSig)
+      return;                    // saved already
+   if(g_bakRetry != 0 && GetTickCount() - g_bakRetry < 5000)
+      return;                    // last attempt failed - wait a moment, then try again
+   string file = BakBase() + ".json";
+   if(g_bakFirst && FileIsExist(file))
+     {
+      // once per indicator instance: keep an older backup whose boxes are not on this chart
+      SPos old[];
+      string err;
+      bool lo;
+      if(ReadBoxesFile(file, old, err, lo) && CountNew(old) > 0 && !SameAsNewestPrev(old))
+        {
+         string gen = NewPrevName();
+         if(gen == "" || !FileCopy(file, 0, gen, 0))
+           {
+            Print("PositionPlanner: backup not written - could not keep the previous backup, error ", GetLastError());
+            g_bakRetry = GetTickCount() | 1;
+            return;              // the old backup stays untouched
+           }
+        }
+     }
+   g_bakFirst = false;
+   if(WriteBackup(file))
+     {
+      g_bakSig   = sig;
+      g_bakRetry = 0;
+      PrunePrev();
+      Dbg("backup -> " + file);
+     }
+   else
+     {
+      g_bakRetry = GetTickCount() | 1;   // the old backup stays; try again in 5 s
+      Print("PositionPlanner: backup failed, error ", GetLastError());
+     }
+  }
+
 //+------------------------------------------------------------------+
 //| Event handlers                                                   |
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   IndicatorSetString(INDICATOR_SHORTNAME, "PositionPlanner");
+   IndicatorSetString(INDICATOR_SHORTNAME, PP_VERSION);
    if(InpRiskValue <= 0)
       Print("PositionPlanner: risk value must be > 0");
 
@@ -2812,7 +3802,12 @@ int OnInit()
    ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
    LoadFromChart();
    if(!InpShowExport)
+     {
       DropButton("EXPORT");
+      DropButton("RESTORE");
+     }
+   g_bakSig   = BoxesSig();   // the boxes as loaded are not a change -> no backup yet
+   g_bakFirst = true;
    CreatePanel();
    DrawAll();
    ChartRedraw();
@@ -2891,6 +3886,9 @@ int OnCalculate(const int rates_total,
    if(!g_drag.on && now - g_lastRefresh >= 2000)
      {
       g_lastRefresh = now;
+      // M1 history was not ready on an earlier pass -> finished boxes may change now
+      bool again = g_m1Pending;
+      g_m1Pending = false;
       datetime t0 = iTime(_Symbol, _Period, 0);
       for(int i = 0; i < ArraySize(g_pos); i++)
         {
@@ -2906,8 +3904,8 @@ int OnCalculate(const int rates_total,
             if(r.ok && !r.open && g_pos[i].t2 < t0)
                continue;            // closed real trade - final
            }
-         if(g_pos[i].t2 < t0 && g_pos[i].ticket <= 0)
-            continue;               // finished box - nothing can change
+         if(g_pos[i].t2 < t0 && g_pos[i].ticket <= 0 && !again)
+            continue;               // finished box - nothing can change (unless M1 history arrived)
          STrade tr;
          SimTrade(g_pos[i], tr);
          DrawTrade(g_pos[i], tr);   // price moved -> update trade area
@@ -3227,6 +4225,9 @@ void OnButton(const string key)
       if(key == "EXPORT")
          ExportJson();
       else
+      if(key == "RESTORE")
+         RestoreClick();
+      else
       if(key == "STATS")
         {
          g_showStats = !g_showStats;
@@ -3276,6 +4277,17 @@ void OnButton(const string key)
   }
 
 void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+  {
+   HandleChartEvent(id, lparam, dparam, sparam);
+   // auto backup after a change (throttled for mouse moves; never in the middle of a drag)
+   if(InpAutoBackup && !g_drag.on && (id != CHARTEVENT_MOUSE_MOVE || GetTickCount() - g_bakCheck >= 500))
+     {
+      g_bakCheck = GetTickCount();
+      MaybeBackup();
+     }
+  }
+
+void HandleChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
   {
    if(id == CHARTEVENT_MOUSE_MOVE)
      {

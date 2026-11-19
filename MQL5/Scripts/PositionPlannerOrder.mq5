@@ -40,7 +40,9 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, otaznik.sk - Michal Škop"
 #property link      "https://www.mql5.com/en/users/otazniksk"
-#property version   "1.00"
+// Internal version: raise it with every change.
+#define PPO_VERSION "1.00"
+#property version   PPO_VERSION
 #property description "Places an order from the active PositionPlanner box - always asks first."
 
 #property script_show_inputs

@@ -23,6 +23,10 @@ asks for confirmation.
 The `.ex5` files are compiled from the `.mq5` sources in the same folder (MetaEditor, 0 errors,
 0 warnings) and are updated together with them.
 
+Each file has an internal version number (`PP_VERSION` in the indicator, `PPO_VERSION` in the
+script), raised with every change. The indicator's version is shown in the chart's indicator
+list, e.g. *PositionPlanner (1.01)*, so you can see which build is running.
+
 ## Installation
 
 1. In MetaTrader 5: **File → Open Data Folder**.
@@ -39,8 +43,8 @@ The `.ex5` files are compiled from the `.mq5` sources in the same folder (MetaEd
   bar, Entry at the clicked price, default Stop = 1.5 × ATR(14) (or fixed pips), Target by the
   default R:R.
 - Drag the handles, like TradingView:
-  - left corners: Target / Stop (and the left edge)
-  - left circle: Entry
+  - left corners: Target / Stop – up and down only, the box does not move sideways
+  - left circle: Entry (and the left edge)
   - right middle: width only (shortening the box never moves your levels)
 - Drag the inside of the box to move it as a whole. Dragging Target across Entry flips
   Long ↔ Short. A dashed crosshair shows the exact price while dragging.
@@ -57,10 +61,16 @@ The `.ex5` files are compiled from the `.mq5` sources in the same folder (MetaEd
   A zero risk setting gives no lot size.
 - Trade simulation on real bars: when price reaches Entry inside the box, the tool checks whether
   Target or Stop is hit first and shows *Target hit*, *Stop hit* or the open P&L (Bid for long /
-  Ask for short). Bars cannot tell the order of prices inside one bar, so the simulation is
-  conservative: Stop and Target in the same bar = Stop; a Stop inside the entry bar = Stop;
-  a Target inside the entry bar alone does not count (the next bars decide). A box without Stop
-  or Target (e.g. an unlinked real-trade box) never "hits" the missing level.
+  Ask for short). One bar does not tell the order of prices inside it, so when it matters
+  (Stop or Target inside the entry bar, or Stop and Target in the same bar) the tool looks at
+  the **M1 bars** inside that bar and takes what really came first. The M1 bars are used only
+  when they rebuild the chart bar exactly (open, high, low, close and tick volume). If M1 cannot
+  decide – the chart is M1 or above D1, the M1 history is not loaded yet or does not match the
+  bar, or everything happened in one minute – the simulation is conservative: Stop and Target in the same bar = Stop; a Stop
+  inside the entry bar = Stop; a Target inside the entry bar alone does not count (the next bars
+  decide). While MT5 is still loading M1 history a box can first show the conservative result
+  and then update itself. A box without Stop or Target (e.g. an unlinked real-trade box) never
+  "hits" the missing level.
 - Money is shown only when it can be calculated; otherwise the value is left out (never 0.00).
 - Labels and handles appear only for the hovered or clicked box.
 - Boxes belong to the symbol they were drawn on: when the chart switches to another symbol they
@@ -82,12 +92,41 @@ or editing its levels turns it into a normal simulated box.
   left out of the statistics – it is never replaced by a simulated result.
 
 ### Panel
-`Long | Short | Lock | Hide | Stats | Export | Clear all | ◄ n / total ►`
+`Long | Short | Lock | Hide | Stats | Export | Restore | Clear all | ◄ n / total ►`
 - **Stats**: boxes, triggered, win / loss / break-even / open, win rate, total in R and money
   (*money n/a* when a counted box has no money result; *n/a* = linked boxes without history).
+  *Max drawdown*: the largest fall of the running total (in R and money) from its previous peak,
+  closed trades in the order they were closed. The exit time is exact for real trades, the M1
+  minute for simulated boxes resolved on M1, otherwise only the bar. Trades whose exit times
+  overlap (order unknown) are taken in their worst possible order; the value is then marked
+  *(worst case)* – the real drawdown is never higher (in rare cases of several chained overlaps
+  it can be lower). R and money are calculated separately. *R n/a* when a
+  closed box has no Stop (no R). *Avg time in trade*: from entry to exit of the
+  closed trades – exact for real trades; simulated boxes are measured by bar times, so the value
+  is marked `~` (bar precision).
+  *Open boxes* lists which boxes are still open (triggered, neither Stop nor Target hit inside
+  the box) by their number in the panel counter `◄ n / total ►` – step to them with ◄ ►.
 - **◄ ►**: jump between all boxes on the chart.
 - **Export** (enable *Show Export button* in inputs): all boxes (or only locked ones) with their
   results to `MQL5\Files\PositionPlanner\*.json` – for spreadsheets, scripts or AI analysis.
+- **Restore** (shown together with Export): brings boxes back, e.g. after MT5 crashed or was
+  killed and the chart was lost (MT5 saves charts and their objects only on a normal exit).
+  It takes the newest backup or full export of the chart's symbol and timeframe that has boxes
+  not on the chart yet. The first click shows the file and how many boxes it would add (in the
+  stats box next to the panel), a second click within 15 s restores them (levels, times, Lock and
+  the link to a real trade). Boxes already on the chart are skipped, so nothing is doubled.
+  Not used: single-box exports, *export only locked boxes* exports and files that are incomplete
+  or damaged (e.g. cut off by a crash). A linked box from a file of another account or server
+  is restored as a normal box (its position id means nothing here); if its real Stop / Target was
+  already past the entry (trailing, break-even) it is skipped. Files written before version 1.08
+  have no account and are taken as this account's.
+- **Auto backup** (input, off by default): after every change the boxes of the chart are saved
+  to `MQL5\Files\PositionPlanner\backup\<account>_<symbol>_<TF>.json`. The file is written to a
+  temporary file first and checked, so a crash while saving never destroys the last good backup;
+  a failed save is retried after 5 s. If a backup holds boxes that are not on the chart (a lost
+  chart), it is first kept as `<account>_<symbol>_<TF>_prev_<time>.json` (never overwritten, the
+  newest 5 are kept), so Restore still finds it.
+  Two charts with the same symbol and timeframe share one backup file – the last change wins.
 
 ### Known limitations
 The indicator works with the data MT5 gives an indicator, so some values are close but not exact:
@@ -112,7 +151,7 @@ right-click menu are temporarily disabled, so you can never move a real SL/TP by
 - Risk mode (% of balance, % of equity, fixed money, fixed lots) and risk value
 - Default SL (0 = auto 1.5 × ATR14), default R:R, box width in bars, pip size mode, snap
 - Colors, zone / trade area opacity, font size, panel corner and offsets
-- Show Export button, export only locked boxes, debug log
+- Show Export (and Restore) button, export only locked boxes, auto backup, debug log
 
 ## Position Planner Order (optional script)
 
