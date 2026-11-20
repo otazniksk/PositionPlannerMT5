@@ -41,17 +41,33 @@ list, e.g. *PositionPlanner (1.01)*, so you can see which build is running.
 ### Usage
 - Click **Long** or **Short** in the panel, then click on the chart: the box starts at the clicked
   bar, Entry at the clicked price, default Stop = 1.5 × ATR(14) (or fixed pips), Target by the
-  default R:R.
+  default R:R. The box is *Box width* bars wide, but no wider than the visible chart to the
+  right of the click, so on a zoomed-in chart or next to the last bar it does not run past the right
+  edge (the minimum is 2 bars, which can still reach past it when you click right at the edge).
 - Drag the handles, like TradingView:
   - left corners: Target / Stop – up and down only, the box does not move sideways
   - left circle: Entry (and the left edge)
-  - right middle: width only (shortening the box never moves your levels)
+  - right middle: width only (shortening the box never moves your levels). When the box reaches
+    past the right edge of the chart, this handle (and the labels) stay at the visible edge, so you
+    can grab it and make the box shorter. If the left edge of the box is right at the chart edge
+    too, the left handles take precedence – move the box left first.
 - Drag the inside of the box to move it as a whole. Dragging Target across Entry flips
   Long ↔ Short. A dashed crosshair shows the exact price while dragging.
 - Lines snap to your open trades and pending orders (can be disabled).
 - **Right-click** a box: Lock / Unlock, Export box (this box only, to
   `MQL5\Files\PositionPlanner\<symbol>_<TF>_<time>_box<id>.json`, works without the Export button), Delete.
 - **Delete** key removes the active box, **Esc** cancels placement or closes the menu.
+- **Ctrl+click** boxes to select several: each one shows its labels like the active box,
+  Ctrl+click a selected box again to deselect it, a normal click (or a click on the empty chart)
+  ends the selection. The **Delete** key or *Delete n boxes* in the right-click menu of a selected
+  box deletes all selected boxes. Ctrl+click never moves a box; the last Ctrl+clicked box is the
+  active one (e.g. for the order script).
+- A **locked** box cannot be moved, edited or deleted one by one: the Delete key skips it (also
+  in a multi-selection – the unlocked selected boxes are deleted, the locked ones stay; its menu
+  then offers *Delete n unlocked*), otherwise the menu shows *Delete (unlock first)* greyed out, and a part deleted in the MT5 object list is put
+  back (boxes of the current symbol; hidden boxes of other symbols are not watched). Unlock it
+  first to delete it – only **Clear all** deletes locked boxes too. Boxes linked to a real trade
+  are locked when created.
 
 ### What you see
 - Target and Stop labels: price, distance (pips or points), money and % of balance.
@@ -106,6 +122,7 @@ or editing its levels turns it into a normal simulated box.
   is marked `~` (bar precision).
   *Open boxes* lists which boxes are still open (triggered, neither Stop nor Target hit inside
   the box) by their number in the panel counter `◄ n / total ►` – step to them with ◄ ►.
+- **Clear all** (click twice): deletes all boxes of the current symbol, locked ones too.
 - **◄ ►**: jump between all boxes on the chart.
 - **Export** (enable *Show Export button* in inputs): all boxes (or only locked ones) with their
   results to `MQL5\Files\PositionPlanner\*.json` – for spreadsheets, scripts or AI analysis.

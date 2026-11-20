@@ -42,7 +42,7 @@
 #property copyright   "Copyright 2026, otaznik.sk - Michal Škop"
 #property link        "https://www.mql5.com/en/users/otazniksk"
 // Internal version: raise it with every change (shown in the chart's indicator list).
-#define PP_VERSION "1.08"
+#define PP_VERSION "1.11"
 #property version     PP_VERSION
 #property description "TradingView-style Long/Short position planner: draw boxes, drag Entry/Stop/Target,"
 #property description "lot size by risk, R:R, trade result simulated on real bars, statistics, navigation, JSON export."
@@ -171,6 +171,7 @@ struct SDrag
 SPos   g_pos[];
 SDrag  g_drag;
 int    g_active      = -1;
+int    g_sel[];               // Ctrl+click: further selected boxes (besides g_active)
 int    g_nextId      = 1;
 bool   g_hidden      = false;
 bool   g_mouseDown   = false;
@@ -469,6 +470,19 @@ bool PosXY(const SPos &p, int &x1, int &x2, int &yE, int &yS, int &yT)
    return true;
   }
 
+// x of the width handle: the right edge, but kept inside the visible chart, so the handle
+// can always be grabbed even when the box reaches past the right edge of the chart.
+// When the left edge itself is at the chart edge the handle stays fully visible (it may then
+// overlap the left handles, which take precedence - move the box left to reach it).
+int HandleRX(const int x1, const int x2)
+  {
+   int cw  = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+   int lim = cw - HANDLE_SIZE;
+   if(x2 <= lim || x1 >= cw)   // fits, or the whole box is off screen to the right
+      return x2;
+   return MathMin(x2, MathMin(MathMax(lim, x1 + HANDLE_SIZE), cw - HANDLE_SIZE / 2 - 2));
+  }
+
 // Snap a time to the start of the nearest bar (objects are drawn snapped to bars,
 // so pixel-positioned handles/badges must use the same times).
 datetime SnapTime(const datetime t)
@@ -516,7 +530,8 @@ int HitTest(const SPos &p, const int x, const int y)
    int x1, x2, yE, yS, yT;
    if(!PosXY(p, x1, x2, yE, yS, yT))
       return HIT_NONE;
-   if(x < x1 - HANDLE_TOL || x > x2 + HANDLE_TOL)
+   int xR = HandleRX(x1, x2);
+   if(x < x1 - HANDLE_TOL || x > MathMax(x2, xR) + HANDLE_TOL)
       return HIT_NONE;
    int top = MathMin(yT, yS), bot = MathMax(yT, yS);
    if(y < top - HANDLE_TOL || y > bot + HANDLE_TOL)
@@ -528,7 +543,7 @@ int HitTest(const SPos &p, const int x, const int y)
       return HIT_H_SL;
    if(MathAbs(x - x1) <= HANDLE_TOL && MathAbs(y - yE) <= HANDLE_TOL)
       return HIT_H_E;
-   if(MathAbs(x - x2) <= HANDLE_TOL && MathAbs(y - yE) <= HANDLE_TOL)
+   if(MathAbs(x - xR) <= HANDLE_TOL && MathAbs(y - yE) <= HANDLE_TOL)
       return HIT_H_R;
    // size / levels change only via the blue handles. The edges do nothing (no resize,
    // no move) - only the inside of the box moves it as a whole.
@@ -764,11 +779,16 @@ void BuildBadge(const string obj, const string &lines[], const color bg, const c
    g_bH[k]   = h;
   }
 
-void PlaceBadge(const string obj, const int cx, const int cy, const int w, const int h, const bool visible)
+void PlaceBadge(const string obj, const int cx, const int cy, const int w, const int h, const bool visible,
+                const bool clampX = false)
   {
    ObjectSetInteger(0, obj, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    ObjectSetInteger(0, obj, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
-   ObjectSetInteger(0, obj, OBJPROP_XDISTANCE, cx - w / 2);
+   // clampX: keep the whole badge inside the chart horizontally (box partly off screen)
+   int bx = cx - w / 2;
+   if(clampX)
+      bx = MathMax(0, MathMin(bx, (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS) - w));
+   ObjectSetInteger(0, obj, OBJPROP_XDISTANCE, bx);
    ObjectSetInteger(0, obj, OBJPROP_YDISTANCE, cy - h / 2);
    SetCommon(obj, false, 20, visible);
   }
@@ -1378,7 +1398,7 @@ void UpdateBadges(const SPos &p)
   {
    int x1, x2, yE, yS, yT;
    // badges + handles only for the active (clicked) or hovered position
-   bool focus = (p.id == g_active) || (p.id == g_hoverId) || (g_drag.on && g_drag.id == p.id);
+   bool focus = (p.id == g_active) || IsSel(p.id) || (p.id == g_hoverId) || (g_drag.on && g_drag.id == p.id);
    bool vis = !g_hidden && focus && PosXY(p, x1, x2, yE, yS, yT);
    if(!vis)
      {
@@ -1461,28 +1481,30 @@ void UpdateBadges(const SPos &p)
    tLines[0] = tTxt;
    sLines[0] = sTxt;
 
-   int cx = (x1 + x2) / 2;
+   bool onScr = x2 >= 0 && x1 < (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);   // box (partly) visible
+   // centre of the visible part of the box (off screen: the real centre, stays off screen)
+   int cx = onScr ? (MathMax(x1, 0) + HandleRX(x1, x2)) / 2 : (x1 + x2) / 2;
    string nT = ObjName(p, "RT"), nS = ObjName(p, "RS"), nE = ObjName(p, "RE");
      {
       int w, h;
-      int boxW = x2 - x1;
+      int boxW = HandleRX(x1, x2) - x1;
       // Like TradingView: a badge wider than the box would cover the corner handles
       // and the lines -> keep a bigger gap from its line.
       int gapNear = 4, gapFar = HANDLE_SIZE / 2 + 4;
       // Target / Stop: outside the box - upper one above its line, lower one below its line
       BuildBadge(nT, tLines, cTP, clrNONE, true, InpFontSize + 1, w, h);
       int g = (w + 2 * HANDLE_SIZE > boxW) ? gapFar : gapNear;
-      PlaceBadge(nT, cx, (yT < yE) ? yT - g - h / 2 : yT + g + h / 2, w, h, true);
+      PlaceBadge(nT, cx, (yT < yE) ? yT - g - h / 2 : yT + g + h / 2, w, h, true, onScr);
       BuildBadge(nS, sLines, cSL, clrNONE, true, InpFontSize + 1, w, h);
       g = (w + 2 * HANDLE_SIZE > boxW) ? gapFar : gapNear;
-      PlaceBadge(nS, cx, (yS < yE) ? yS - g - h / 2 : yS + g + h / 2, w, h, true);
+      PlaceBadge(nS, cx, (yS < yE) ? yS - g - h / 2 : yS + g + h / 2, w, h, true, onScr);
       // middle badge: more prominent (bold, white border). Centered on the entry line;
       // when the box is not clearly wider than it (~40 px free on each side), it moves just below the entry line.
       BuildBadge(nE, eLines, bgE, clrWhite, true, InpFontSize + 1, w, h);
       if(w + 98 > boxW)
-         PlaceBadge(nE, cx, yE + gapFar + h / 2, w, h, true);
+         PlaceBadge(nE, cx, yE + gapFar + h / 2, w, h, true, onScr);
       else
-         PlaceBadge(nE, cx, yE, w, h, true);
+         PlaceBadge(nE, cx, yE, w, h, true, onScr);
      }
 
    // blue grab handles (hidden for locked positions)
@@ -1491,7 +1513,7 @@ void UpdateBadges(const SPos &p)
    DrawHandle(ObjName(p, "H1"), x1, yT, false, false, hv && !Dragging(p, HIT_H_TP));
    DrawHandle(ObjName(p, "H2"), x1, yS, false, false, hv && !Dragging(p, HIT_H_SL));
    DrawHandle(ObjName(p, "H3"), x1, yE, true,  false, hv && !Dragging(p, HIT_H_E));
-   DrawHandle(ObjName(p, "H4"), x2, yE, false, true,  hv && !Dragging(p, HIT_H_R));
+   DrawHandle(ObjName(p, "H4"), HandleRX(x1, x2), yE, false, true,  hv && !Dragging(p, HIT_H_R));
   }
 
 // Like TradingView: the handle being dragged is hidden until the mouse is released,
@@ -1807,7 +1829,7 @@ void CreatePanel()
    MakeButton("STATS", "Stats",  cBtn, cBtnText, "Show / hide statistics of all boxes on the chart");
    MakeButton("EXPORT", "Export", cBtn, cBtnText, "Export boxes and their simulated results to JSON (MQL5\\Files\\PositionPlanner)");
    MakeButton("RESTORE", "Restore", cBtn, cBtnText, "Restore boxes from the newest backup / export of this symbol and timeframe (click twice)");
-   MakeButton("CLEAR", "Clear all", cBtn, cBtnText, "Delete ALL positions (click twice). Active box: Delete key");
+   MakeButton("CLEAR", "Clear all", cBtn, cBtnText, "Delete ALL boxes incl. locked ones (click twice). Active box: Delete key");
    MakeButton("PREV", "◄",      cBtn, cBtnText, "Previous box on the chart (by time)");
    MakeButton("CNT", "0",      cBtn, cBtnText, "Active box / number of boxes - click to jump to the active box");
    MakeButton("NEXT", "►",      cBtn, cBtnText, "Next box on the chart (by time)");
@@ -2590,6 +2612,15 @@ void NewPos(const int dir, const datetime tc, const double price)
    int  bars = MathMax(InpBoxBars, 2);
    long ps   = PeriodSeconds();
    p.t1 = SnapTime(tc);
+   // zoomed-in chart: no wider than the visible chart to the right of the click
+   // (MT5 draws 2^scale px per bar), so the right edge and its handle stay on screen
+   int xc, yc;
+   if(ChartTimePriceToXY(0, 0, p.t1, price, xc, yc))
+     {
+      int barPx = 1 << (int)ChartGetInteger(0, CHART_SCALE);
+      int room  = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS) - HANDLE_SIZE - xc;
+      bars = MathMax(2, MathMin(bars, room / MathMax(barPx, 1)));
+     }
    p.t2 = SnapTime((datetime)((long)p.t1 + bars * ps));
    if(p.t2 <= p.t1)
       p.t2 = (datetime)((long)p.t1 + bars * ps);
@@ -2626,13 +2657,15 @@ void DeletePos(const int id)
       g_active = -1;
    if(g_hoverId == id)
       g_hoverId = -1;
+   SelRemove(id);
    UpdatePanel();
    ChartRedraw();
   }
 
 void DeleteAllPos()
   {
-   // only the boxes of this symbol - boxes of other symbols (hidden) stay on the chart
+   // all boxes of this symbol, locked ones too (the only way to delete a locked box without
+   // unlocking it) - boxes of other symbols (hidden) stay on the chart
    int ids[];
    int n = ArraySize(g_pos);
    ArrayResize(ids, n);
@@ -2644,14 +2677,122 @@ void DeleteAllPos()
       ObjectsDeleteAll(0, PosPrefix(ids[i]));
       FreeBadges(PosPrefix(ids[i]));
      }
-   g_active = -1;
+   g_active  = -1;
+   g_hoverId = -1;
+   ArrayResize(g_sel, 0);
    Dbg("deleted all positions");
    UpdatePanel();
    ChartRedraw();
   }
 
-void SetActive(const int id)
+//--- multi-selection (Ctrl+click): g_active + g_sel[] ---------------
+bool IsSel(const int id)
   {
+   for(int k = 0; k < ArraySize(g_sel); k++)
+      if(g_sel[k] == id)
+         return true;
+   return false;
+  }
+
+void SelRemove(const int id)
+  {
+   int n = ArraySize(g_sel);
+   for(int k = 0; k < n; k++)
+      if(g_sel[k] == id)
+        {
+         for(int j = k; j < n - 1; j++)
+            g_sel[j] = g_sel[j + 1];
+         ArrayResize(g_sel, n - 1);
+         return;
+        }
+  }
+
+void SelClear()
+  {
+   int ids[];
+   ArrayCopy(ids, g_sel);
+   ArrayResize(g_sel, 0);
+   for(int k = 0; k < ArraySize(ids); k++)
+     {
+      int i = FindPos(ids[k]);
+      if(i >= 0)
+         DrawPos(g_pos[i]);
+     }
+  }
+
+// all selected boxes: the active one + Ctrl+clicked ones
+int SelectedIds(int &ids[])
+  {
+   ArrayResize(ids, 0);
+   if(FindPos(g_active) >= 0)
+     {
+      ArrayResize(ids, 1);
+      ids[0] = g_active;
+     }
+   for(int k = 0; k < ArraySize(g_sel); k++)
+      if(FindPos(g_sel[k]) >= 0 && g_sel[k] != g_active)
+        {
+         int n = ArraySize(ids);
+         ArrayResize(ids, n + 1);
+         ids[n] = g_sel[k];
+        }
+   return ArraySize(ids);
+  }
+
+// Ctrl+click on a box: add it to the selection (it becomes the active one) or remove it.
+void SelToggle(const int id)
+  {
+   if(id == g_active)
+     {
+      int n = ArraySize(g_sel);
+      int next = n > 0 ? g_sel[n - 1] : -1;
+      if(n > 0)
+         ArrayResize(g_sel, n - 1);
+      SetActive(next, true);
+     }
+   else
+      if(IsSel(id))
+        {
+         SelRemove(id);
+         int i = FindPos(id);
+         if(i >= 0)
+            DrawPos(g_pos[i]);
+        }
+      else
+        {
+         if(g_active >= 0 && FindPos(g_active) >= 0)
+           {
+            int n = ArraySize(g_sel);
+            ArrayResize(g_sel, n + 1);
+            g_sel[n] = g_active;
+           }
+         SetActive(id, true);
+        }
+   Dbg(StringFormat("selection: active=%d + %d more", g_active, ArraySize(g_sel)));
+  }
+
+// Deletes the selected boxes; locked ones are skipped (unlock first or use Clear all).
+void DeleteSelected()
+  {
+   int ids[];
+   int n = SelectedIds(ids), skipped = 0;
+   for(int k = 0; k < n; k++)
+     {
+      int i = FindPos(ids[k]);
+      if(i < 0)
+         continue;
+      if(g_pos[i].locked)
+         skipped++;
+      else
+         DeletePos(ids[k]);
+     }
+   Dbg(StringFormat("delete selected: %d box(es), %d locked skipped", n - skipped, skipped));
+  }
+
+void SetActive(const int id, const bool keepSel = false)
+  {
+   if(!keepSel && ArraySize(g_sel) > 0)
+      SelClear();
    int prev = g_active;
    g_active = id;
    int i = FindPos(prev);
@@ -2758,7 +2899,7 @@ bool PointInPanel(const int x, const int y)
    return false;
   }
 
-void StartDrag(const int x, const int y)
+void StartDrag(const int x, const int y, const bool ctrl = false)
   {
    if(PointInPanel(x, y))
       return;               // button click is handled by OBJECT_CLICK
@@ -2786,12 +2927,18 @@ void StartDrag(const int x, const int y)
       BlockTradeDrag(true);   // safety net, normally already blocked by hover
    if(id < 0)
      {
-      // click on empty chart -> deactivate (hides badges)
-      if(g_active != -1)
+      // click on empty chart -> deactivate (hides badges); Ctrl+click on empty chart keeps the selection
+      if(!ctrl && (g_active != -1 || ArraySize(g_sel) > 0))
         {
          SetActive(-1);
          ChartRedraw();
         }
+      return;
+     }
+   if(ctrl)
+     {
+      SelToggle(id);   // Ctrl+click: select / deselect, never drags
+      ChartRedraw();
       return;
      }
    SetActive(id);
@@ -3203,6 +3350,7 @@ void LoadFromChart()
 
    int n = ArraySize(g_pos);
    g_active = -1;   // nothing active after load -> badges hidden until hover/click
+   ArrayResize(g_sel, 0);
    Dbg(StringFormat("loaded %d position(s) from chart, %d of other symbols hidden, removed %d stale object(s), hidden=%d",
                     n, ArraySize(foreign), ArraySize(junk), g_hidden));
   }
@@ -3877,6 +4025,15 @@ int OnCalculate(const int rates_total,
          UpdateBadges(g_pos[ih]);
          upd = true;
         }
+      for(int k = 0; k < ArraySize(g_sel); k++)   // Ctrl+selected boxes show their labels too
+        {
+         int is = FindPos(g_sel[k]);
+         if(is >= 0 && is != ia && is != ih)
+           {
+            UpdateBadges(g_pos[is]);
+            upd = true;
+           }
+        }
       if(upd)
          ChartRedraw();
      }
@@ -4032,7 +4189,8 @@ void DrawMenu()
             for(int x = 3; x < mw - 3; x++)
                data[y * w + x] = ARGB((y == ty || y == ty + MENU_ROW_H - 1 || x == 3 || x == mw - 4) ? hotBd : hotBg, 1.0);
       int cy = ty + MENU_ROW_H / 2;
-      TextOut(g_menuText[i], MENU_ICON_W + 8, cy, TA_LEFT | TA_VCENTER, data, w, h, ARGB(fg, 1.0), COLOR_FORMAT_ARGB_NORMALIZE);
+      bool off = g_menuKeys[i] == "DELOFF";
+      TextOut(g_menuText[i], MENU_ICON_W + 8, cy, TA_LEFT | TA_VCENTER, data, w, h, ARGB(off ? C'150,150,150' : fg, 1.0), COLOR_FORMAT_ARGB_NORMALIZE);
       if(g_menuShort[i] != "")
          TextOut(g_menuShort[i], mw - 20, cy, TA_RIGHT | TA_VCENTER, data, w, h, ARGB(fgKey, 1.0), COLOR_FORMAT_ARGB_NORMALIZE);
       MenuIcon(data, w, g_menuKeys[i], 15, cy);
@@ -4147,8 +4305,35 @@ void OpenMenu(const int id, const int x, const int y)
    MenuAdd("LOCK", g_pos[i].locked ? "Unlock" : "Lock");
    MenuAdd("EXP",  "Export box");
    MenuAdd("SEP",  "");
-   MenuAdd("DEL",  "Delete", "Del");
-   SetActive(id);
+   // right-click on a selected box keeps the selection: Delete then removes all selected
+   bool inSel = id == g_active || IsSel(id);
+   if(inSel && id != g_active)
+     {
+      // promote a selected box to active, the previous active one stays selected
+      SelRemove(id);
+      if(FindPos(g_active) >= 0)
+        {
+         int ns0 = ArraySize(g_sel);
+         ArrayResize(g_sel, ns0 + 1);
+         g_sel[ns0] = g_active;
+        }
+     }
+   SetActive(id, inSel);
+   int sel[];
+   int ns = SelectedIds(sel), nu = 0;
+   for(int k = 0; k < ns; k++)
+     {
+      int j = FindPos(sel[k]);
+      if(j >= 0 && !g_pos[j].locked)
+         nu++;
+     }
+   if(nu == 0)
+      MenuAdd("DELOFF", "Delete (unlock first)");   // greyed out, not clickable
+   else
+      if(g_pos[i].locked)   // locked box in a selection with unlocked ones: delete those
+         MenuAdd("DEL", StringFormat("Delete %d unlocked", nu), "Del");
+      else
+         MenuAdd("DEL", nu > 1 ? StringFormat("Delete %d boxes", nu) : "Delete", "Del");
    DrawMenu();
    Dbg(StringFormat("menu opened id=%d", id));
    ChartRedraw();
@@ -4172,7 +4357,7 @@ int MenuRowAt(const int x, const int y)
    int tops[];
    MenuLayout(tops);
    for(int i = 0; i < ArraySize(tops); i++)
-      if(g_menuKeys[i] != "SEP" && y - g_menuY >= tops[i] && y - g_menuY < tops[i] + MENU_ROW_H)
+      if(g_menuKeys[i] != "SEP" && g_menuKeys[i] != "DELOFF" && y - g_menuY >= tops[i] && y - g_menuY < tops[i] + MENU_ROW_H)
          return i;
    return -1;
   }
@@ -4207,7 +4392,7 @@ void MenuAction(const int row)
          ExportJson(id);
       else
          if(key == "DEL")
-            DeletePos(id);
+            DeleteSelected();   // the clicked box + the other selected ones (locked skipped)
    UpdatePanel();
    ChartRedraw();
   }
@@ -4313,7 +4498,7 @@ void HandleChartEvent(const int id, const long &lparam, const double &dparam, co
          else
            {
             CloseMenu();
-            if(g_active != -1)      // right-click on empty chart deselects, like a left click
+            if(g_active != -1 || ArraySize(g_sel) > 0)   // right-click on empty chart deselects, like a left click
               {
                SetActive(-1);
                ChartRedraw();
@@ -4348,7 +4533,7 @@ void HandleChartEvent(const int id, const long &lparam, const double &dparam, co
       if(down && !g_mouseDown)
         {
          g_mouseDown = true;
-         StartDrag(x, y);
+         StartDrag(x, y, (state & 8) != 0);   // 8 = Ctrl held
         }
       else
          if(down && g_drag.on)
@@ -4372,11 +4557,11 @@ void HandleChartEvent(const int id, const long &lparam, const double &dparam, co
       return;
      }
 
-   if(id == CHARTEVENT_KEYDOWN && lparam == 46 && g_active > 0 && !g_drag.on)   // Delete key -> delete active box
+   if(id == CHARTEVENT_KEYDOWN && lparam == 46 && (g_active > 0 || ArraySize(g_sel) > 0) && !g_drag.on)   // Delete key -> delete active box
      {
       CloseMenu();
       Dbg("Delete key");
-      DeletePos(g_active);
+      DeleteSelected();   // active + Ctrl+clicked boxes; locked ones stay
       return;
      }
 
@@ -4435,7 +4620,16 @@ void HandleChartEvent(const int id, const long &lparam, const double &dparam, co
         {
          int i = FindPos(pid);
          if(i >= 0 && g_pos[i].dir == dir)
-            DeletePos(pid);
+           {
+            if(g_pos[i].locked)
+              {
+               DrawPos(g_pos[i]);   // locked box: put the deleted part back
+               ChartRedraw();
+               Dbg(StringFormat("locked id=%d - deleted part restored", pid));
+              }
+            else
+               DeletePos(pid);
+           }
         }
       return;
      }
